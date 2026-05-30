@@ -54,35 +54,77 @@ pub async fn fetch_tiktok_oembed(url: &Url) -> Result<PageMetadata, AppError> {
     })
 }
 
-/// Fetch Instagram post via ddinstagram proxy (no API key needed)
+/// Fetch Instagram post by scraping OG tags directly with a mobile User-Agent
 ///
-/// Instagram's oEmbed API now requires a Meta app access token. Instead,
-/// we use ddinstagram.com — a lightweight front-end that renders Instagram
-/// posts as clean HTML with proper Open Graph tags.
+/// Instagram's oEmbed API now requires a Meta app access token, and the desktop
+/// login page has no useful metadata. However, Instagram serves full OG tags
+/// (og:title, og:description, name="description" with caption text) to mobile
+/// User-Agents even without logging in.
 pub async fn fetch_instagram_oembed(url: &Url) -> Result<PageMetadata, AppError> {
-    // Convert instagram.com to ddinstagram.com, stripping query params
-    // (ddinstagram doesn't handle Instagram's tracking params like ?igsh=)
-    let dd_url_str = url.as_str().replace("instagram.com", "ddinstagram.com");
-    let dd_url = match Url::parse(&dd_url_str) {
-        Ok(mut u) => {
-            u.set_query(None); // strip tracking params like ?igsh=
-            u
-        }
-        Err(e) => {
-            tracing::warn!("Failed to build ddinstagram URL: {e}, falling back to direct scrape");
-            return fetch_og_tags_or_url(url, "Instagram Post").await;
-        }
-    };
+    let mut clean_url = url.clone();
+    clean_url.set_query(None); // strip tracking params like ?igsh=
 
-    tracing::info!("Fetching Instagram post via ddinstagram proxy: {dd_url}");
+    tracing::info!("Fetching Instagram post with mobile UA: {clean_url}");
 
-    match fetch_og_tags(&dd_url).await {
-        Ok(metadata) => Ok(metadata),
-        Err(e) => {
-            tracing::warn!("ddinstagram proxy failed for {dd_url}, falling back to direct scrape: {e}");
-            fetch_og_tags_or_url(url, "Instagram Post").await
-        }
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let resp = client.get(clean_url.as_str()).send().await?;
+
+    if !resp.status().is_success() {
+        tracing::warn!("Instagram returned status {} for {clean_url}", resp.status());
+        return fetch_og_tags_or_url(url, "Instagram Post").await;
     }
+
+    let html = resp.text().await?;
+    let document = scraper::Html::parse_document(&html);
+
+    // Extract og:title or twitter:title
+    let title_selector =
+        scraper::Selector::parse("meta[property='og:title'], meta[name='twitter:title'], title")
+            .unwrap();
+    let title = document
+        .select(&title_selector)
+        .next()
+        .and_then(|el| {
+            if el.value().name() == "title" {
+                Some(el.text().collect::<String>())
+            } else {
+                el.value().attr("content").map(|s| s.to_string())
+            }
+        })
+        .unwrap_or_else(|| "Instagram Post".to_string());
+
+    // Extract og:description or meta description (contains the post caption)
+    let desc_selector = scraper::Selector::parse(
+        "meta[property='og:description'], meta[name='description'], meta[name='twitter:description']",
+    )
+    .unwrap();
+    let og_description = document
+        .select(&desc_selector)
+        .next()
+        .and_then(|el| el.value().attr("content"))
+        .unwrap_or("")
+        .to_string();
+
+    // Extract author from twitter:title (format: "Username (@handle) • Instagram post type")
+    // or from the og:title prefix
+    let author = title
+        .split(" on Instagram")
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let content = format!("{title}\n\n{og_description}");
+
+    Ok(PageMetadata {
+        title,
+        description: og_description,
+        author,
+        content,
+    })
 }
 
 /// Fetch YouTube oEmbed data
