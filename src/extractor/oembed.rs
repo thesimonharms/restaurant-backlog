@@ -54,55 +54,31 @@ pub async fn fetch_tiktok_oembed(url: &Url) -> Result<PageMetadata, AppError> {
     })
 }
 
-/// Fetch Instagram oEmbed data
+/// Fetch Instagram post via ddinstagram proxy (no API key needed)
+///
+/// Instagram's oEmbed API now requires a Meta app access token. Instead,
+/// we use ddinstagram.com — a lightweight front-end that renders Instagram
+/// posts as clean HTML with proper Open Graph tags.
 pub async fn fetch_instagram_oembed(url: &Url) -> Result<PageMetadata, AppError> {
-    let encoded: String = url::form_urlencoded::byte_serialize(url.as_str().as_bytes()).collect();
-    let oembed_url = format!("https://api.instagram.com/oembed?url={encoded}");
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(&oembed_url)
-        .header("User-Agent", "Mozilla/5.0 (compatible; RestaurantBacklogBot/1.0)")
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        return fetch_og_tags_or_url(url, "Instagram Reel").await;
-    }
-
-    let data = match parse_oembed_json(resp).await {
-        Ok(data) => data,
+    // Convert instagram.com to ddinstagram.com
+    let dd_url_str = url.as_str().replace("instagram.com", "ddinstagram.com");
+    let dd_url = match Url::parse(&dd_url_str) {
+        Ok(u) => u,
         Err(e) => {
-            tracing::warn!("Instagram oEmbed returned an undecodable response, falling back to Open Graph tags: {e}");
-            return fetch_og_tags_or_url(url, "Instagram Reel").await;
+            tracing::warn!("Failed to build ddinstagram URL: {e}, falling back to direct scrape");
+            return fetch_og_tags_or_url(url, "Instagram Post").await;
         }
     };
 
-    let title = data["title"]
-        .as_str()
-        .unwrap_or("Untitled Instagram Post")
-        .to_string();
+    tracing::info!("Fetching Instagram post via ddinstagram proxy: {dd_url}");
 
-    let description = data["description"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-
-    let author = data["author_name"].as_str().map(|s| s.to_string());
-
-    let content = vec![
-        title.clone(),
-        description.clone(),
-        author.clone().unwrap_or_default(),
-    ]
-    .join("\n");
-
-    Ok(PageMetadata {
-        title,
-        description,
-        author,
-        content,
-    })
+    match fetch_og_tags(&dd_url).await {
+        Ok(metadata) => Ok(metadata),
+        Err(e) => {
+            tracing::warn!("ddinstagram proxy failed for {dd_url}, falling back to direct scrape: {e}");
+            fetch_og_tags_or_url(url, "Instagram Post").await
+        }
+    }
 }
 
 /// Fetch YouTube oEmbed data
