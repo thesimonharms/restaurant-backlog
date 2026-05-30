@@ -1,0 +1,56 @@
+[package]
+name = "restaurant-backlog"
+version = "0.1.0"
+edition = "2021"
+description = "A Telegram bot that builds a restaurant backlog from shared social media links"
+
+[dependencies]
+# Multi-provider AI client (your crate!)
+baochuan = "0.1"
+
+# Telegram bot framework — explicit features for rustls TLS
+teloxide = { version = "0.12", default-features = false, features = [
+    "macros",
+    "rustls",
+    "ctrlc_handler",
+    "auto-send",
+    "cache-me",
+    "erased",
+    "throttle",
+    "trace-adaptor",
+] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client (v0.12 for our own use, rustls-tls)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Database (rustls avoids system OpenSSL)
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+    "macros",
+] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTML parsing for fallback link extraction
+scraper = "0.22"
+
+# Config/env
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+log = "0.4"
+
+# Utilities
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+url = "2"
+thiserror = "2"
+regex = "1"
