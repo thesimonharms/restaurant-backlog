@@ -21,13 +21,13 @@ impl Config {
             .collect();
 
         if allowed_user_ids.is_empty() && !allowed_raw.is_empty() {
-            log::warn!("ALLOWED_USER_IDS was set but no valid IDs could be parsed: {allowed_raw}");
+            tracing::warn!("ALLOWED_USER_IDS was set but no valid IDs could be parsed: {allowed_raw}");
         }
 
         if allowed_user_ids.is_empty() {
-            log::info!("No ALLOWED_USER_IDS set — all users can interact with the bot");
+            tracing::info!("No ALLOWED_USER_IDS set — all users can interact with the bot");
         } else {
-            log::info!("Allowlist active: {} user(s) can use the bot", allowed_user_ids.len());
+            tracing::info!("Allowlist active: {} user(s) can use the bot", allowed_user_ids.len());
         }
 
         Ok(Self {

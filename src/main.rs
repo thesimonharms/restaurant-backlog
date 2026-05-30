@@ -14,6 +14,8 @@ use teloxide::types::CallbackQuery;
 use teloxide::types::InlineKeyboardButton;
 use teloxide::types::InlineKeyboardMarkup;
 use teloxide::types::ParseMode;
+use teloxide::utils::command::BotCommands;
+use teloxide::utils::html;
 
 pub struct AppState {
     pub db: db::DbPool,
@@ -44,13 +46,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = config::Config::from_env()?;
-    log::info!("Configuration loaded ✓");
+    tracing::info!("Configuration loaded ✓");
 
     let pool = db::init_pool(&config.database_url).await?;
-    log::info!("Database connected ✓");
+    tracing::info!("Database connected ✓");
 
     let ai_client = DeepSeekClient::new(config.deepseek_api_key);
-    log::info!("AI client initialized ✓");
+    tracing::info!("AI client initialized ✓");
 
     let state: Arc<AppState> = Arc::new(AppState {
         db: pool,
@@ -59,7 +61,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let bot = Bot::new(&config.telegram_token);
-    log::info!("Starting Restaurant Backlog Bot... 🍜");
+    let me = bot.get_me().await?;
+    tracing::info!("Connected to Telegram as {}", me.mention());
+
+    bot.set_my_commands(Command::bot_commands()).await?;
+    tracing::info!("Registered bot commands");
 
     // ── Command handlers ──────────────────────────────────────────────
     let cmd_handler = Update::filter_message()
@@ -88,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .enable_ctrlc_handler()
     .build();
 
+    tracing::info!("Restaurant Backlog Bot is polling for updates. Press Ctrl+C to stop.");
     dispatcher.dispatch().await;
     Ok(())
 }
@@ -100,8 +107,17 @@ async fn handle_command(
     bot: Bot,
     state: Arc<AppState>,
 ) -> Result<(), teloxide::RequestError> {
+    let user_id = msg.from().map(|u| u.id.0 as i64);
+    tracing::info!(
+        user_id = ?user_id,
+        chat_id = msg.chat.id.0,
+        command = ?cmd,
+        "Received command"
+    );
+
     // Auth gate: silently ignore unauthorized users
-    if !state.is_user_allowed(msg.from().map(|u| u.id.0 as i64)) {
+    if !state.is_user_allowed(user_id) {
+        tracing::warn!(user_id = ?user_id, "Ignoring command from unauthorized user");
         return Ok(());
     }
 
@@ -133,8 +149,15 @@ async fn handle_shared_link(
         None => return Ok(()),
     };
 
+    tracing::info!(
+        user_id,
+        chat_id = msg.chat.id.0,
+        "Received non-command text message"
+    );
+
     // Auth gate: silently ignore unauthorized users
     if !state.is_user_allowed(Some(user_id)) {
+        tracing::warn!(user_id, "Ignoring shared link from unauthorized user");
         return Ok(());
     }
 
@@ -217,7 +240,7 @@ async fn handle_shared_link(
                 saved
                     .cuisine_tags
                     .iter()
-                    .map(|t| format!("#{}", t))
+                    .map(|t| format!("#{}", html::escape(t)))
                     .collect::<Vec<_>>()
                     .join("  ")
             };
@@ -225,22 +248,28 @@ async fn handle_shared_link(
             let maps_link = saved
                 .google_maps_url
                 .as_deref()
-                .map(|u| format!("\n📍 <a href=\"{u}\">Open in Google Maps</a>"))
+                .map(|u| format!("\n📍 {}", html::link(u, "Open in Google Maps")))
                 .unwrap_or_default();
 
             let desc = saved
                 .description
                 .as_deref()
-                .map(|d| format!("\n📝 {d}"))
+                .map(|d| format!("\n📝 {}", html::escape(d)))
                 .unwrap_or_default();
 
+            let name = html::escape(&saved.name);
+            let src = saved
+                .source_url
+                .as_deref()
+                .map(|u| html::link(u, "Original Post"))
+                .unwrap_or_else(|| "Original Post".to_string());
             let card = format!(
-                "✅ <b>Saved!</b>\n\n🍽️ <b>{name}</b>{desc}\n\n🏷️ {tags}{maps}\n\n🔗 <a href=\"{src}\">Original Post</a>",
-                name = saved.name,
+                "✅ <b>Saved!</b>\n\n🍽️ <b>{name}</b>{desc}\n\n🏷️ {tags}{maps}\n\n🔗 {src}",
+                name = name,
                 desc = desc,
                 tags = tags,
                 maps = maps_link,
-                src = saved.source_url.as_deref().unwrap_or("")
+                src = src
             );
 
             let keyboard = InlineKeyboardMarkup::new(vec![vec![
@@ -277,8 +306,12 @@ async fn handle_callback(
     bot: Bot,
     state: Arc<AppState>,
 ) -> Result<(), teloxide::RequestError> {
+    let user_id = q.from.id.0 as i64;
+    tracing::info!(user_id, "Received callback query");
+
     // Auth gate: silently ignore unauthorized users
-    if !state.is_user_allowed(Some(q.from.id.0 as i64)) {
+    if !state.is_user_allowed(Some(user_id)) {
+        tracing::warn!(user_id, "Ignoring callback from unauthorized user");
         return Ok(());
     }
 
@@ -292,7 +325,7 @@ async fn handle_callback(
         ["visited", id_str] => {
             if let Ok(id) = uuid::Uuid::parse_str(id_str) {
                 if let Err(e) = db::mark_visited(&state.db, id).await {
-                    log::error!("Failed to mark visited: {e}");
+                    tracing::error!("Failed to mark visited: {e}");
                 }
                 bot.answer_callback_query(q.id)
                     .text("✅ Marked as visited!")
@@ -306,9 +339,8 @@ async fn handle_callback(
         }
         ["delete", id_str] => {
             if let Ok(id) = uuid::Uuid::parse_str(id_str) {
-                let user_id = q.from.id.0 as i64;
                 if let Err(e) = db::delete_restaurant(&state.db, id, user_id).await {
-                    log::error!("Failed to delete: {e}");
+                    tracing::error!("Failed to delete: {e}");
                 }
                 bot.answer_callback_query(q.id)
                     .text("🗑️ Deleted!")

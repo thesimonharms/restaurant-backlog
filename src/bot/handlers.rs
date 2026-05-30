@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
 use teloxide::prelude::*;
+use teloxide::utils::html;
 use teloxide::utils::command::BotCommands;
 use crate::db;
 use crate::AppState;
 
 /// Bot commands
-#[derive(BotCommands, Clone)]
+#[derive(BotCommands, Clone, Debug)]
 #[command(rename_rule = "lowercase")]
 pub enum Command {
     #[command(description = "Show help")]
@@ -33,7 +34,7 @@ pub async fn cmd_start(bot: Bot, msg: Message) -> Result<(), teloxide::RequestEr
         <b>How to use:</b>\n\
         • Forward or paste a link → I'll extract the restaurant info automatically\n\
         • Use /list to browse your backlog\n\
-        • Use /find <what you're craving> for AI recommendations\n\
+        • Use /find &lt;what you're craving&gt; for AI recommendations\n\
         • Use /tags to see all your cuisine tags\n\
         • Use /random when you can't decide\n\n\
         <b>Pro tip:</b> Share this bot with your fiancée so you can both add to the same backlog! 🍜"
@@ -78,9 +79,18 @@ pub async fn cmd_list(bot: Bot, msg: Message, state: Arc<AppState>) -> Result<()
                     let tags = if r.cuisine_tags.is_empty() {
                         String::new()
                     } else {
-                        format!(" [{}]", r.cuisine_tags.join(", "))
+                        let tags = r
+                            .cuisine_tags
+                            .iter()
+                            .map(|tag| html::escape(tag))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!(" [{tags}]")
                     };
-                    format!("• <b>{name}</b>{visited}{tags}", name = r.name)
+                    format!(
+                        "• <b>{name}</b>{visited}{tags}",
+                        name = html::escape(&r.name)
+                    )
                 })
                 .collect();
 
@@ -177,7 +187,7 @@ pub async fn cmd_tags(
         Ok(tags) => {
             let tag_display = tags
                 .iter()
-                .map(|t| format!("#{}", t))
+                .map(|t| format!("#{}", html::escape(t)))
                 .collect::<Vec<_>>()
                 .join("  ");
             bot.send_message(
@@ -211,22 +221,29 @@ pub async fn cmd_random(
             let tags = if restaurant.cuisine_tags.is_empty() {
                 String::new()
             } else {
-                format!("\n🏷️ {}", restaurant.cuisine_tags.join(", "))
+                let tags = restaurant
+                    .cuisine_tags
+                    .iter()
+                    .map(|tag| html::escape(tag))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("\n🏷️ {tags}")
             };
             let maps = restaurant
                 .google_maps_url
-                .map(|u| format!("\n📍 <a href=\"{u}\">Google Maps</a>"))
+                .map(|u| format!("\n📍 {}", html::link(&u, "Google Maps")))
                 .unwrap_or_default();
             let desc = restaurant
                 .description
-                .map(|d| format!("\n{d}"))
+                .map(|d| format!("\n{}", html::escape(&d)))
                 .unwrap_or_default();
+            let name = html::escape(&restaurant.name);
 
             bot.send_message(
                 msg.chat.id,
                 format!(
                     "🎲 <b>Random Pick!</b>\n\n🍽️ <b>{name}</b>{desc}{tags}{maps}",
-                    name = restaurant.name
+                    name = name
                 ),
             )
             .parse_mode(teloxide::types::ParseMode::Html)

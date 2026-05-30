@@ -19,7 +19,13 @@ pub async fn fetch_tiktok_oembed(url: &Url) -> Result<PageMetadata, AppError> {
         return fetch_og_tags(url).await;
     }
 
-    let data: serde_json::Value = resp.json().await?;
+    let data = match parse_oembed_json(resp).await {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::warn!("TikTok oEmbed returned an undecodable response, falling back to Open Graph tags: {e}");
+            return fetch_og_tags(url).await;
+        }
+    };
 
     let title = data["title"]
         .as_str()
@@ -61,10 +67,16 @@ pub async fn fetch_instagram_oembed(url: &Url) -> Result<PageMetadata, AppError>
         .await?;
 
     if !resp.status().is_success() {
-        return fetch_og_tags(url).await;
+        return fetch_og_tags_or_url(url, "Instagram Reel").await;
     }
 
-    let data: serde_json::Value = resp.json().await?;
+    let data = match parse_oembed_json(resp).await {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::warn!("Instagram oEmbed returned an undecodable response, falling back to Open Graph tags: {e}");
+            return fetch_og_tags_or_url(url, "Instagram Reel").await;
+        }
+    };
 
     let title = data["title"]
         .as_str()
@@ -109,7 +121,13 @@ pub async fn fetch_youtube_oembed(url: &Url) -> Result<PageMetadata, AppError> {
         return fetch_og_tags(url).await;
     }
 
-    let data: serde_json::Value = resp.json().await?;
+    let data = match parse_oembed_json(resp).await {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::warn!("YouTube oEmbed returned an undecodable response, falling back to Open Graph tags: {e}");
+            return fetch_og_tags(url).await;
+        }
+    };
 
     let title = data["title"]
         .as_str()
@@ -128,6 +146,26 @@ pub async fn fetch_youtube_oembed(url: &Url) -> Result<PageMetadata, AppError> {
         author,
         content,
     })
+}
+
+async fn fetch_og_tags_or_url(url: &Url, fallback_title: &str) -> Result<PageMetadata, AppError> {
+    match fetch_og_tags(url).await {
+        Ok(metadata) => Ok(metadata),
+        Err(e) => {
+            tracing::warn!("Open Graph fallback failed for {url}, using URL-only metadata: {e}");
+            Ok(PageMetadata {
+                title: fallback_title.to_string(),
+                description: String::new(),
+                content: format!("{fallback_title}\n{}", url.as_str()),
+                ..Default::default()
+            })
+        }
+    }
+}
+
+async fn parse_oembed_json(resp: reqwest::Response) -> Result<serde_json::Value, AppError> {
+    let body = resp.text().await?;
+    serde_json::from_str(&body).map_err(AppError::from)
 }
 
 /// Fallback: extract Open Graph tags and page content via HTML scraping
