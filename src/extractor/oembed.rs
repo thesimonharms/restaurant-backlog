@@ -60,10 +60,14 @@ pub async fn fetch_tiktok_oembed(url: &Url) -> Result<PageMetadata, AppError> {
 /// we use ddinstagram.com — a lightweight front-end that renders Instagram
 /// posts as clean HTML with proper Open Graph tags.
 pub async fn fetch_instagram_oembed(url: &Url) -> Result<PageMetadata, AppError> {
-    // Convert instagram.com to ddinstagram.com
+    // Convert instagram.com to ddinstagram.com, stripping query params
+    // (ddinstagram doesn't handle Instagram's tracking params like ?igsh=)
     let dd_url_str = url.as_str().replace("instagram.com", "ddinstagram.com");
     let dd_url = match Url::parse(&dd_url_str) {
-        Ok(u) => u,
+        Ok(mut u) => {
+            u.set_query(None); // strip tracking params like ?igsh=
+            u
+        }
         Err(e) => {
             tracing::warn!("Failed to build ddinstagram URL: {e}, falling back to direct scrape");
             return fetch_og_tags_or_url(url, "Instagram Post").await;
