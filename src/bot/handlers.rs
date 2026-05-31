@@ -37,7 +37,7 @@ pub async fn cmd_start(bot: Bot, msg: Message) -> Result<(), teloxide::RequestEr
         • Use /find &lt;what you're craving&gt; for AI recommendations\n\
         • Use /tags to see all your cuisine tags\n\
         • Use /random when you can't decide\n\n\
-        <b>Pro tip:</b> Share this bot with your fiancée so you can both add to the same backlog! 🍜"
+        <b>Pro tip:</b> Share this bot with friends to build the backlog together! 🍜"
     )
     .parse_mode(teloxide::types::ParseMode::Html)
     .await?;

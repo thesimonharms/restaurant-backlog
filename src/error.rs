@@ -20,9 +20,18 @@ pub enum AppError {
     #[error("Telegram error: {0}")]
     Telegram(#[from] teloxide::RequestError),
 
+    #[error("Discord error: {0}")]
+    Discord(String),
+
     #[error("Config error: {0}")]
     Config(#[from] crate::config::ConfigError),
 
     #[error("Regex error: {0}")]
     Regex(#[from] regex::Error),
+}
+
+impl From<serenity::Error> for AppError {
+    fn from(e: serenity::Error) -> Self {
+        AppError::Discord(e.to_string())
+    }
 }

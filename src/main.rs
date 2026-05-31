@@ -2,6 +2,7 @@ mod ai;
 mod bot;
 mod config;
 mod db;
+mod discord;
 mod error;
 mod extractor;
 
@@ -21,10 +22,11 @@ pub struct AppState {
     pub db: db::DbPool,
     pub ai: DeepSeekClient,
     pub allowed_user_ids: Vec<i64>,
+    pub discord_allowed_user_ids: Vec<u64>,
 }
 
 impl AppState {
-    /// Check if a user is allowed to interact with the bot.
+    /// Check if a Telegram user is allowed to interact with the bot.
     /// When the allowlist is empty, everyone is allowed.
     pub fn is_user_allowed(&self, user_id: Option<i64>) -> bool {
         match user_id {
@@ -51,21 +53,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = db::init_pool(&config.database_url).await?;
     tracing::info!("Database connected ✓");
 
-    let ai_client = DeepSeekClient::new(config.deepseek_api_key);
+    let ai_client = DeepSeekClient::new(config.deepseek_api_key.clone());
     tracing::info!("AI client initialized ✓");
 
     let state: Arc<AppState> = Arc::new(AppState {
         db: pool,
         ai: ai_client,
-        allowed_user_ids: config.allowed_user_ids,
+        allowed_user_ids: config.allowed_user_ids.clone(),
+        discord_allowed_user_ids: config.discord_allowed_user_ids.clone(),
     });
 
+    // ── Telegram bot ─────────────────────────────────────────────────
+    let telegram_state = Arc::clone(&state);
+    let telegram_config = config.clone();
+    let tg = tokio::spawn(async move {
+        run_telegram(telegram_state, &telegram_config).await;
+    });
+
+    // ── Discord bot ──────────────────────────────────────────────────
+    let discord_state = Arc::clone(&state);
+    let dc = tokio::spawn(async move {
+        discord::run_discord(discord_state, &config).await;
+    });
+
+    // Wait for BOTH to finish — tokio::select! would cancel the other
+    // when one completes, which is wrong (Discord returns immediately
+    // when no token is configured, killing Telegram mid-connection).
+    let (tg_result, dc_result) = tokio::join!(tg, dc);
+
+    if let Err(e) = tg_result {
+        tracing::error!("Telegram task panicked: {e}");
+    }
+    if let Err(e) = dc_result {
+        tracing::error!("Discord task panicked: {e}");
+    }
+
+    Ok(())
+}
+
+/// Run the Telegram bot with its own dispatcher
+async fn run_telegram(state: Arc<AppState>, config: &config::Config) {
     let bot = Bot::new(&config.telegram_token);
-    let me = bot.get_me().await?;
+    let me = match bot.get_me().await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("Failed to connect to Telegram: {e}");
+            return;
+        }
+    };
     tracing::info!("Connected to Telegram as {}", me.mention());
 
-    bot.set_my_commands(Command::bot_commands()).await?;
-    tracing::info!("Registered bot commands");
+    if let Err(e) = bot.set_my_commands(Command::bot_commands()).await {
+        tracing::warn!("Failed to register Telegram bot commands: {e}");
+    } else {
+        tracing::info!("Registered Telegram bot commands");
+    }
 
     // ── Command handlers ──────────────────────────────────────────────
     let cmd_handler = Update::filter_message()
@@ -94,9 +136,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .enable_ctrlc_handler()
     .build();
 
-    tracing::info!("Restaurant Backlog Bot is polling for updates. Press Ctrl+C to stop.");
+    tracing::info!("Restaurant Backlog Bot (Telegram) is polling for updates. Press Ctrl+C to stop.");
     dispatcher.dispatch().await;
-    Ok(())
 }
 
 // ── Command routing ───────────────────────────────────────────────────
