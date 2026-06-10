@@ -239,3 +239,46 @@ pub async fn delete_last_restaurants(pool: &DbPool, user_id: i64, n: i64) -> Res
     .await?;
     Ok(result.rows_affected())
 }
+
+/// Get the most recently added restaurant for a user
+pub async fn get_last_restaurant(pool: &DbPool, user_id: i64) -> Result<Option<Restaurant>, sqlx::Error> {
+    sqlx::query_as::<_, Restaurant>(
+        r#"
+        SELECT * FROM restaurants
+        WHERE user_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Update a restaurant's name and details
+pub async fn update_restaurant(
+    pool: &DbPool,
+    id: uuid::Uuid,
+    name: &str,
+    description: Option<&str>,
+    cuisine_tags: &[String],
+    google_maps_url: Option<&str>,
+) -> Result<Restaurant, sqlx::Error> {
+    let tags: &[String] = cuisine_tags;
+
+    sqlx::query_as::<_, Restaurant>(
+        r#"
+        UPDATE restaurants
+        SET name = $1, description = $2, cuisine_tags = $3, google_maps_url = $4
+        WHERE id = $5
+        RETURNING *
+        "#,
+    )
+    .bind(name)
+    .bind(description)
+    .bind(tags)
+    .bind(google_maps_url)
+    .bind(id)
+    .fetch_one(pool)
+    .await
+}

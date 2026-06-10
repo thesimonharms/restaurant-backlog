@@ -7,8 +7,6 @@ mod error;
 mod extractor;
 
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::collections::HashMap;
 
 use ai::deepseek::DeepSeekClient;
 use bot::handlers::Command;
@@ -20,21 +18,11 @@ use teloxide::types::ParseMode;
 use teloxide::utils::command::BotCommands;
 use teloxide::utils::html;
 
-/// Track a user who was just asked for a restaurant name after AI failure
-#[derive(Debug, Clone)]
-pub struct PendingAddition {
-    pub user_id: i64,
-    pub chat_id: i64,
-    pub source_url: Option<String>,
-    pub title: String,
-}
-
 pub struct AppState {
     pub db: db::DbPool,
     pub ai: DeepSeekClient,
     pub allowed_user_ids: Vec<i64>,
     pub discord_allowed_user_ids: Vec<u64>,
-    pub pending_additions: Mutex<HashMap<i64, PendingAddition>>,
 }
 
 impl AppState {
@@ -73,7 +61,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ai: ai_client,
         allowed_user_ids: config.allowed_user_ids.clone(),
         discord_allowed_user_ids: config.discord_allowed_user_ids.clone(),
-        pending_additions: Mutex::new(HashMap::new()),
     });
 
     // ── Telegram bot ─────────────────────────────────────────────────
@@ -219,14 +206,7 @@ async fn handle_shared_link(
 
     let url = match extractor::extract_url(&text) {
         Some(u) => u,
-        None => {
-            // No URL in message — check if user has a pending name input
-            let pending = state.pending_additions.lock().unwrap().remove(&user_id);
-            if let Some(p) = pending {
-                return handle_name_reply(msg, bot, state, text.to_string(), p).await;
-            }
-            return Ok(());
-        }
+        None => return Ok(()),
     };
 
     let processing = bot
@@ -261,37 +241,79 @@ async fn handle_shared_link(
     {
         Ok(list) => list,
         Err(e) => {
-            // Store pending so the user can reply with a name
-            state.pending_additions.lock().unwrap().insert(user_id, PendingAddition {
+            // Save with the video title as a fallback name
+            let fallback = db::models::NewRestaurant {
+                owner_id: db::derive_owner_id(user_id),
                 user_id,
-                chat_id: msg.chat.id.0,
+                name: metadata.title.clone(),
                 source_url: Some(url.to_string()),
-                title: metadata.title.clone(),
-            });
-            bot.edit_message_text(
-                msg.chat.id,
-                processing.id,
-                format!("⚠️ AI had trouble: {e}\n\nWhat's the restaurant name? Just send it as a reply."),
-            )
-            .await?;
+                google_maps_url: None,
+                description: None,
+                cuisine_tags: vec![],
+            };
+            match db::save_restaurant(&state.db, &fallback).await {
+                Ok(saved) => {
+                    let name = html::escape(&saved.name);
+                    let src = html::link(url.as_str(), "Original Post");
+                    let card = format!(
+                        "⚠️ <b>Saved with placeholder name</b>\n\n🍽️ <b>{name}</b>\n\n🔗 {src}\n\n📝 Use <code>/add Correct Name</code> to rename it.",
+                    );
+                    let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                        InlineKeyboardButton::callback("🗑️ Delete", format!("delete:{}", saved.id)),
+                    ]]);
+                    bot.edit_message_text(msg.chat.id, processing.id, card)
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(keyboard)
+                        .await?;
+                }
+                Err(db_err) => {
+                    bot.edit_message_text(
+                        msg.chat.id,
+                        processing.id,
+                        format!("⚠️ AI: {e}\n\nCouldn't save fallback: {db_err}"),
+                    )
+                    .await?;
+                }
+            }
             return Ok(());
         }
     };
 
     if extracted_list.is_empty() {
-        // Store pending so the user can reply with a name
-        state.pending_additions.lock().unwrap().insert(user_id, PendingAddition {
+        // Save with the video title as a fallback name
+        let fallback = db::models::NewRestaurant {
+            owner_id: db::derive_owner_id(user_id),
             user_id,
-            chat_id: msg.chat.id.0,
+            name: metadata.title.clone(),
             source_url: Some(url.to_string()),
-            title: metadata.title.clone(),
-        });
-        bot.edit_message_text(
-            msg.chat.id,
-            processing.id,
-            "🤷 Couldn't find any restaurants in that content.",
-        )
-        .await?;
+            google_maps_url: None,
+            description: None,
+            cuisine_tags: vec![],
+        };
+        match db::save_restaurant(&state.db, &fallback).await {
+            Ok(saved) => {
+                let name = html::escape(&saved.name);
+                let src = html::link(url.as_str(), "Original Post");
+                let card = format!(
+                    "🤷 <b>No restaurants detected</b>\n\nSaved as: 🍽️ <b>{name}</b>\n\n🔗 {src}\n\n📝 Use <code>/add Correct Name</code> to rename it.",
+                );
+                let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                    InlineKeyboardButton::callback("🗑️ Delete", format!("delete:{}", saved.id)),
+                ]]);
+                bot.edit_message_text(msg.chat.id, processing.id, card)
+                    .parse_mode(ParseMode::Html)
+                    .reply_markup(keyboard)
+                    .await?;
+            }
+            Err(db_err) => {
+                bot.edit_message_text(
+                    msg.chat.id,
+                    processing.id,
+                    format!("🤷 No restaurants detected.\n\nCouldn't save fallback: {db_err}"),
+                )
+                .await?;
+            }
+        }
         return Ok(());
     }
 
@@ -446,108 +468,6 @@ async fn handle_shared_link(
             format!("⚠️ Some saves failed:\n{}", save_errors.join("\n")),
         )
         .await?;
-    }
-
-    Ok(())
-}
-
-/// Handle a user's reply when they were asked for a restaurant name
-/// after the AI failed to extract info from a link.
-async fn handle_name_reply(
-    msg: Message,
-    bot: Bot,
-    state: Arc<AppState>,
-    name: String,
-    pending: PendingAddition,
-) -> Result<(), teloxide::RequestError> {
-    let user_id = pending.user_id;
-    let name = name.trim().to_string();
-
-    if name.is_empty() {
-        // Empty reply — set pending back so they can try again
-        state.pending_additions.lock().unwrap().insert(user_id, pending);
-        bot.send_message(msg.chat.id, "What's the restaurant name? Just type it and send.")
-            .reply_to_message_id(msg.id)
-            .await?;
-        return Ok(());
-    }
-
-    let processing = bot
-        .send_message(msg.chat.id, "🧠 Looking up info on that restaurant...")
-        .reply_to_message_id(msg.id)
-        .await?;
-
-    // Try to enrich with AI, using the original post title as context
-    let context = format!("From a social media post titled: {}", pending.title);
-    let extracted = match state.ai.enrich_restaurant_name(&name, &context).await {
-        Ok(info) => info,
-        Err(_) => {
-            // AI enrichment failed — save with just the name
-            db::models::ExtractedInfo {
-                restaurant_name: Some(name.clone()),
-                cuisine_type: None,
-                tags: vec![],
-                google_maps_query: Some(name.clone()),
-                description: None,
-            }
-        }
-    };
-
-    let restaurant_name = extracted.restaurant_name.clone().unwrap_or_else(|| name.clone());
-
-    let google_maps_url = extracted.google_maps_query.as_ref().map(|q| {
-        let encoded: String = url::form_urlencoded::Serializer::new(String::new())
-            .append_key_only(q)
-            .finish();
-        format!("https://www.google.com/maps/search/{encoded}")
-    });
-
-    let new_restaurant = db::models::NewRestaurant {
-        owner_id: db::derive_owner_id(user_id),
-        user_id,
-        name: restaurant_name,
-        source_url: pending.source_url,
-        google_maps_url,
-        description: extracted.description,
-        cuisine_tags: extracted.tags,
-    };
-
-    match db::save_restaurant(&state.db, &new_restaurant).await {
-        Ok(saved) => {
-            let tags_display = if saved.cuisine_tags.is_empty() {
-                "No tags".to_string()
-            } else {
-                saved.cuisine_tags.iter()
-                    .map(|t| format!("#{}", html::escape(t)))
-                    .collect::<Vec<_>>()
-                    .join("  ")
-            };
-            let maps_link = saved.google_maps_url.as_deref()
-                .map(|u| format!("\n📍 {}", html::link(u, "Open in Google Maps")))
-                .unwrap_or_default();
-            let desc = saved.description.as_deref()
-                .map(|d| format!("\n📝 {}", html::escape(d)))
-                .unwrap_or_default();
-            let name_escaped = html::escape(&saved.name);
-
-            let card = format!(
-                "✅ <b>Saved!</b>\n\n🍽️ <b>{name_escaped}</b>{desc}\n\n🏷️ {tags_display}{maps_link}",
-            );
-
-            let keyboard = InlineKeyboardMarkup::new(vec![vec![
-                InlineKeyboardButton::callback("✅ Visited", format!("visited:{}", saved.id)),
-                InlineKeyboardButton::callback("🗑️ Delete", format!("delete:{}", saved.id)),
-            ]]);
-
-            bot.edit_message_text(msg.chat.id, processing.id, card)
-                .parse_mode(ParseMode::Html)
-                .reply_markup(keyboard)
-                .await?;
-        }
-        Err(e) => {
-            bot.edit_message_text(msg.chat.id, processing.id, format!("❌ Couldn't save: {e}"))
-                .await?;
-        }
     }
 
     Ok(())

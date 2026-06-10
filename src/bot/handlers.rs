@@ -307,7 +307,7 @@ pub async fn cmd_undo(
     Ok(())
 }
 
-/// /add command — manually add a restaurant by name
+/// /add command — rename the last added restaurant
 pub async fn cmd_add(
     bot: Bot,
     msg: Message,
@@ -323,39 +323,69 @@ pub async fn cmd_add(
         .strip_prefix("/add")
         .or_else(|| text.strip_prefix("/add@"))
         .unwrap_or("")
-        .trim();
+        .trim()
+        .to_string();
 
     if name.is_empty() {
         bot.send_message(
             msg.chat.id,
-            "Usage: <code>/add Restaurant Name</code>\n\nExample: <code>/add Sushi Tanaka Tokyo</code>",
+            "Usage: <code>/add Correct Restaurant Name</code>\n\nRenames the last restaurant you added.",
         )
         .parse_mode(teloxide::types::ParseMode::Html)
         .await?;
         return Ok(());
     }
 
+    // Find the last restaurant for this user
+    let last = match db::get_last_restaurant(&state.db, user_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            bot.send_message(
+                msg.chat.id,
+                "📭 Your backlog is empty. Send a link first or try <code>/add Restaurant Name</code> to create one.",
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await?;
+            return Ok(());
+        }
+        Err(e) => {
+            bot.send_message(msg.chat.id, format!("❌ Couldn't find last restaurant: {e}"))
+                .await?;
+            return Ok(());
+        }
+    };
+
     let processing = bot
-        .send_message(msg.chat.id, "🧠 Looking up info on that restaurant...")
+        .send_message(
+            msg.chat.id,
+            format!("✏️ Renaming <b>{}</b> ...", teloxide::utils::html::escape(&last.name)),
+        )
+        .parse_mode(teloxide::types::ParseMode::Html)
         .reply_to_message_id(msg.id)
         .await?;
 
-    // Try to enrich with AI
-    let extracted = match state.ai.enrich_restaurant_name(name, "Manually added by user. No source link.").await {
+    // Try to enrich with AI for cuisine, tags, description, maps
+    let context = if let Some(ref url) = last.source_url {
+        format!("From source: {url}")
+    } else {
+        "Manually renamed by user.".to_string()
+    };
+
+    let extracted = match state.ai.enrich_restaurant_name(&name, &context).await {
         Ok(info) => info,
         Err(_) => {
-            // AI failed, save with just the name
+            // AI failed — just use the name with a Google Maps search
             db::models::ExtractedInfo {
-                restaurant_name: Some(name.to_string()),
+                restaurant_name: Some(name.clone()),
                 cuisine_type: None,
                 tags: vec![],
-                google_maps_query: Some(name.to_string()),
+                google_maps_query: Some(name.clone()),
                 description: None,
             }
         }
     };
 
-    let restaurant_name = extracted.restaurant_name.clone().unwrap_or_else(|| name.to_string());
+    let final_name = extracted.restaurant_name.clone().unwrap_or_else(|| name.clone());
     let google_maps_url = extracted.google_maps_query.as_ref().map(|q| {
         let encoded: String = url::form_urlencoded::Serializer::new(String::new())
             .append_key_only(q)
@@ -363,41 +393,40 @@ pub async fn cmd_add(
         format!("https://www.google.com/maps/search/{encoded}")
     });
 
-    let new_restaurant = db::models::NewRestaurant {
-        owner_id: crate::db::derive_owner_id(user_id),
-        user_id,
-        name: restaurant_name,
-        source_url: None,
-        google_maps_url,
-        description: extracted.description,
-        cuisine_tags: extracted.tags,
-    };
-
-    match db::save_restaurant(&state.db, &new_restaurant).await {
-        Ok(saved) => {
-            let tags_display = if saved.cuisine_tags.is_empty() {
+    match db::update_restaurant(
+        &state.db,
+        last.id,
+        &final_name,
+        extracted.description.as_deref(),
+        &extracted.tags,
+        google_maps_url.as_deref(),
+    )
+    .await
+    {
+        Ok(updated) => {
+            let tags_display = if updated.cuisine_tags.is_empty() {
                 "No tags".to_string()
             } else {
-                saved.cuisine_tags.iter()
+                updated.cuisine_tags.iter()
                     .map(|t| format!("#{}", teloxide::utils::html::escape(t)))
                     .collect::<Vec<_>>()
                     .join("  ")
             };
-            let maps_link = saved.google_maps_url.as_deref()
+            let maps_link = updated.google_maps_url.as_deref()
                 .map(|u| format!("\n📍 {}", teloxide::utils::html::link(u, "Open in Google Maps")))
                 .unwrap_or_default();
-            let desc = saved.description.as_deref()
+            let desc = updated.description.as_deref()
                 .map(|d| format!("\n📝 {}", teloxide::utils::html::escape(d)))
                 .unwrap_or_default();
-            let name_escaped = teloxide::utils::html::escape(&saved.name);
+            let name_escaped = teloxide::utils::html::escape(&updated.name);
 
             let card = format!(
-                "✅ <b>Saved!</b>\n\n🍽️ <b>{name_escaped}</b>{desc}\n\n🏷️ {tags_display}{maps_link}",
+                "✏️ <b>Renamed!</b>\n\n🍽️ <b>{name_escaped}</b>{desc}\n\n🏷️ {tags_display}{maps_link}",
             );
 
             let keyboard = teloxide::types::InlineKeyboardMarkup::new(vec![vec![
-                teloxide::types::InlineKeyboardButton::callback("✅ Visited", format!("visited:{}", saved.id)),
-                teloxide::types::InlineKeyboardButton::callback("🗑️ Delete", format!("delete:{}", saved.id)),
+                teloxide::types::InlineKeyboardButton::callback("✅ Visited", format!("visited:{}", updated.id)),
+                teloxide::types::InlineKeyboardButton::callback("🗑️ Delete", format!("delete:{}", updated.id)),
             ]]);
 
             bot.edit_message_text(msg.chat.id, processing.id, card)
@@ -406,8 +435,12 @@ pub async fn cmd_add(
                 .await?;
         }
         Err(e) => {
-            bot.edit_message_text(msg.chat.id, processing.id, format!("❌ Couldn't save: {e}"))
-                .await?;
+            bot.edit_message_text(
+                msg.chat.id,
+                processing.id,
+                format!("❌ Couldn't rename: {e}"),
+            )
+            .await?;
         }
     }
 
