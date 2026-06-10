@@ -31,6 +31,9 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
     // Run migrations (fatal on failure — schema must be correct)
     run_migrations(&pool).await?;
 
+    // Set up RLS policies (non-fatal — runs every startup, idempotent)
+    setup_rls(&pool).await;
+
     Ok(pool)
 }
 
@@ -43,6 +46,35 @@ async fn run_migrations(pool: &DbPool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(migration_002).execute(pool).await?;
 
     Ok(())
+}
+
+/// Configure Row Level Security policies on the restaurants table.
+/// Runs on every startup — uses DROP IF EXISTS so it's fully idempotent.
+/// Non-fatal: if Supabase-specific functions aren't available, the bot
+/// still works fine (the postgres role bypasses RLS anyway).
+async fn setup_rls(pool: &DbPool) {
+    let sql = r#"
+        ALTER TABLE IF EXISTS restaurants ENABLE ROW LEVEL SECURITY;
+
+        DROP POLICY IF EXISTS "Owner select" ON restaurants;
+        DROP POLICY IF EXISTS "Owner insert" ON restaurants;
+        DROP POLICY IF EXISTS "Owner update" ON restaurants;
+        DROP POLICY IF EXISTS "Owner delete" ON restaurants;
+
+        CREATE POLICY "Owner select" ON restaurants
+            FOR SELECT USING (owner_id = current_setting('app.current_owner_id', true)::uuid);
+        CREATE POLICY "Owner insert" ON restaurants
+            FOR INSERT WITH CHECK (owner_id = current_setting('app.current_owner_id', true)::uuid);
+        CREATE POLICY "Owner update" ON restaurants
+            FOR UPDATE USING (owner_id = current_setting('app.current_owner_id', true)::uuid);
+        CREATE POLICY "Owner delete" ON restaurants
+            FOR DELETE USING (owner_id = current_setting('app.current_owner_id', true)::uuid);
+    "#;
+
+    match sqlx::raw_sql(sql).execute(pool).await {
+        Ok(_) => tracing::info!("RLS policies configured"),
+        Err(e) => tracing::warn!("RLS setup skipped (non-fatal): {e}"),
+    }
 }
 
 /// Save a new restaurant to the backlog
