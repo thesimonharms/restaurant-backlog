@@ -341,12 +341,12 @@ async fn handle_discord_link(
         return;
     }
 
-    let extracted = match state
+    let extracted_list = match state
         .ai
-        .extract_restaurant_info(&metadata.title, &metadata.content, url.as_str())
+        .extract_restaurants(&metadata.title, &metadata.content, url.as_str())
         .await
     {
-        Ok(info) => info,
+        Ok(list) => list,
         Err(e) => {
             let _ = processing
                 .edit(
@@ -360,79 +360,122 @@ async fn handle_discord_link(
         }
     };
 
-    let restaurant_name = extracted
-        .restaurant_name
-        .clone()
-        .unwrap_or_else(|| metadata.title.clone());
+    if extracted_list.is_empty() {
+        let _ = processing
+            .edit(&ctx.http, EditMessage::new().content("🤷 Couldn't find any restaurants in that content."))
+            .await;
+        return;
+    }
 
-    let google_maps_url = if let Some(ref query) = extracted.google_maps_query {
-        let encoded: String =
-            url::form_urlencoded::Serializer::new(String::new())
-                .append_key_only(query)
-                .finish();
-        Some(format!("https://www.google.com/maps/search/{encoded}"))
+    // Save all extracted restaurants
+    let mut saved_names: Vec<String> = Vec::new();
+    let mut save_errors: Vec<String> = Vec::new();
+
+    for extracted in &extracted_list {
+        let restaurant_name = extracted
+            .restaurant_name
+            .clone()
+            .unwrap_or_else(|| metadata.title.clone());
+
+        let google_maps_url = if let Some(ref query) = extracted.google_maps_query {
+            let encoded: String =
+                url::form_urlencoded::Serializer::new(String::new())
+                    .append_key_only(query)
+                    .finish();
+            Some(format!("https://www.google.com/maps/search/{encoded}"))
+        } else {
+            None
+        };
+
+        let new_restaurant = db::models::NewRestaurant {
+            owner_id: db::derive_owner_id(user_id as i64),
+            user_id: user_id as i64,
+            name: restaurant_name,
+            source_url: Some(url.to_string()),
+            google_maps_url,
+            description: extracted.description.clone(),
+            cuisine_tags: extracted.tags.clone(),
+        };
+
+        match db::save_restaurant(&state.db, &new_restaurant).await {
+            Ok(saved) => saved_names.push(saved.name),
+            Err(e) => save_errors.push(format!("{}: {e}", extracted.restaurant_name.as_deref().unwrap_or("Unknown"))),
+        }
+    }
+
+    // Build summary card
+    let count = saved_names.len();
+    if count == 0 {
+        let error_detail = if save_errors.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nErrors:\n{}", save_errors.join("\n"))
+        };
+        let _ = processing
+            .edit(&ctx.http, EditMessage::new().content(format!("❌ Couldn't save any restaurants.{}", error_detail)))
+            .await;
+    } else if count == 1 {
+        // Single restaurant: detailed card
+        let extracted = &extracted_list[0];
+        let tags_display = if extracted.tags.is_empty() {
+            "No tags".to_string()
+        } else {
+            extracted
+                .tags
+                .iter()
+                .map(|t| format!("#{t}"))
+                .collect::<Vec<_>>()
+                .join("  ")
+        };
+        let maps_link = extracted
+            .google_maps_query
+            .as_ref()
+            .map(|q| {
+                let encoded: String =
+                    url::form_urlencoded::Serializer::new(String::new())
+                        .append_key_only(q)
+                        .finish();
+                format!("\n📍 **Google Maps:** https://www.google.com/maps/search/{encoded}")
+            })
+            .unwrap_or_default();
+        let desc = extracted
+            .description
+            .as_deref()
+            .map(|d| format!("\n📝 {d}"))
+            .unwrap_or_default();
+        let src = format!("\n🔗 **Source:** {}", url.as_str());
+
+        let card = format!(
+            "✅ **Saved!**\n\n🍽️ **{name}**{desc}\n\n🏷️ {tags_display}{maps}{src}",
+            name = saved_names[0],
+            desc = desc,
+            tags_display = tags_display,
+            maps = maps_link,
+            src = src
+        );
+
+        let _ = processing
+            .edit(&ctx.http, EditMessage::new().content(card))
+            .await;
     } else {
-        None
-    };
+        // Multiple restaurants: summary list
+        let names_list: Vec<String> = saved_names
+            .iter()
+            .map(|n| format!("🍽️ **{n}**"))
+            .collect();
+        let src = format!("\n🔗 **Source:** {}", url.as_str());
 
-    let new_restaurant = db::models::NewRestaurant {
-        user_id: user_id as i64,
-        name: restaurant_name,
-        source_url: Some(url.to_string()),
-        google_maps_url,
-        description: extracted.description,
-        cuisine_tags: extracted.tags,
-    };
-
-    match db::save_restaurant(&state.db, &new_restaurant).await {
-        Ok(saved) => {
-            let tags = if saved.cuisine_tags.is_empty() {
-                "No tags".to_string()
-            } else {
-                saved
-                    .cuisine_tags
-                    .iter()
-                    .map(|t| format!("#{t}"))
-                    .collect::<Vec<_>>()
-                    .join("  ")
-            };
-
-            let maps_link = saved
-                .google_maps_url
-                .as_deref()
-                .map(|u| format!("\n📍 **Google Maps:** {u}"))
-                .unwrap_or_default();
-
-            let desc = saved
-                .description
-                .as_deref()
-                .map(|d| format!("\n📝 {d}"))
-                .unwrap_or_default();
-
-            let src = saved
-                .source_url
-                .as_deref()
-                .map(|u| format!("\n🔗 **Source:** {u}"))
-                .unwrap_or_default();
-
-            let card = format!(
-                "✅ **Saved!**\n\n🍽️ **{name}**{desc}\n\n🏷️ {tags}{maps}{src}",
-                name = saved.name,
-                desc = desc,
-                tags = tags,
-                maps = maps_link,
-                src = src
-            );
-
-            let _ = processing
-                .edit(&ctx.http, EditMessage::new().content(card))
-                .await;
+        let mut card = format!(
+            "✅ **Saved {count} restaurants!**\n\n{}\n{src}",
+            names_list.join("\n"),
+        );
+        if !save_errors.is_empty() {
+            card.push_str(&format!("\n\n⚠️ Some saves failed:\n{}", save_errors.join("\n")));
         }
-        Err(e) => {
-            let _ = processing
-                .edit(&ctx.http, EditMessage::new().content(format!("❌ Couldn't save: {e}")))
-                .await;
-        }
+
+        let _ = processing
+            .edit(&ctx.http, EditMessage::new().content(card))
+            .await;
     }
 }
 

@@ -24,6 +24,8 @@ pub enum Command {
     Random,
     #[command(description = "Mark a restaurant as visited")]
     Visited,
+    #[command(description = "Undo: remove the most recent saved restaurant")]
+    Undo,
 }
 
 /// /start command
@@ -272,5 +274,33 @@ pub async fn cmd_visited(
         "Reply to a restaurant card with /visited to mark it as visited, or use the button on the card!",
     )
     .await?;
+    Ok(())
+}
+
+/// /undo command — delete the most recently saved restaurant
+pub async fn cmd_undo(
+    bot: Bot,
+    msg: Message,
+    state: Arc<AppState>,
+) -> Result<(), teloxide::RequestError> {
+    let user_id = msg.from().map(|u| u.id.0 as i64);
+    let Some(user_id) = user_id else {
+        return Ok(());
+    };
+
+    match db::delete_last_restaurants(&state.db, user_id, 1).await {
+        Ok(count) if count > 0 => {
+            bot.send_message(msg.chat.id, format!("🗑️ Removed {count} restaurant(s) from your backlog."))
+                .await?;
+        }
+        Ok(_) => {
+            bot.send_message(msg.chat.id, "📭 Your backlog is empty — nothing to undo.")
+                .await?;
+        }
+        Err(e) => {
+            bot.send_message(msg.chat.id, format!("❌ Couldn't undo: {e}")).await?;
+        }
+    }
+
     Ok(())
 }

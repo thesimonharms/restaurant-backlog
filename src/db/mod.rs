@@ -3,10 +3,21 @@ pub mod models;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::time::Duration;
+use uuid::Uuid;
 
 use self::models::{NewRestaurant, Restaurant};
 
 pub type DbPool = PgPool;
+
+/// Derive a deterministic owner_id UUID from a Telegram/Discord user_id.
+/// Uses UUID v5 with a fixed namespace so the same user always gets the same UUID.
+/// This is used for RLS scoping and must match the SQL backfill pattern.
+pub fn derive_owner_id(user_id: i64) -> Uuid {
+    let namespace = Uuid::parse_str("6ba7b811-9dad-11d1-80b4-00c04fd430c8")
+        .expect("Invalid namespace UUID");
+    let data = format!("restaurant-backlog-user-{user_id}");
+    Uuid::new_v5(&namespace, data.as_bytes())
+}
 
 /// Initialize the database connection pool
 pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
@@ -17,16 +28,20 @@ pub async fn init_pool(database_url: &str) -> Result<DbPool, sqlx::Error> {
         .connect(database_url)
         .await?;
 
-    // Run migration
+    // Run migrations (fatal on failure — schema must be correct)
     run_migrations(&pool).await?;
 
     Ok(pool)
 }
 
-/// Run the SQL migration file
+/// Run the SQL migration files
 async fn run_migrations(pool: &DbPool) -> Result<(), sqlx::Error> {
-    let migration_sql = include_str!("../../migrations/001_create_restaurants.sql");
-    sqlx::raw_sql(migration_sql).execute(pool).await?;
+    let migration_001 = include_str!("../../migrations/001_create_restaurants.sql");
+    sqlx::raw_sql(migration_001).execute(pool).await?;
+
+    let migration_002 = include_str!("../../migrations/002_add_owner_id_rls.sql");
+    sqlx::raw_sql(migration_002).execute(pool).await?;
+
     Ok(())
 }
 
@@ -39,11 +54,12 @@ pub async fn save_restaurant(
 
     sqlx::query_as::<_, Restaurant>(
         r#"
-        INSERT INTO restaurants (user_id, name, source_url, google_maps_url, description, cuisine_tags)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO restaurants (owner_id, user_id, name, source_url, google_maps_url, description, cuisine_tags)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING *
         "#,
     )
+    .bind(restaurant.owner_id)
     .bind(restaurant.user_id)
     .bind(&restaurant.name)
     .bind(&restaurant.source_url)
@@ -170,4 +186,24 @@ pub async fn delete_restaurant(pool: &DbPool, id: uuid::Uuid, user_id: i64) -> R
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Delete the most recent N restaurants for a user
+pub async fn delete_last_restaurants(pool: &DbPool, user_id: i64, n: i64) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM restaurants
+        WHERE id IN (
+            SELECT id FROM restaurants
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+        )
+        "#,
+    )
+    .bind(user_id)
+    .bind(n)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }

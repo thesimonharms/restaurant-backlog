@@ -170,6 +170,7 @@ async fn handle_command(
         Command::Tags => bot::handlers::cmd_tags(bot, msg, state).await,
         Command::Random => bot::handlers::cmd_random(bot, msg, state).await,
         Command::Visited => bot::handlers::cmd_visited(bot, msg, state).await,
+        Command::Undo => bot::handlers::cmd_undo(bot, msg, state).await,
     }
 }
 
@@ -232,12 +233,12 @@ async fn handle_shared_link(
     )
     .await?;
 
-    let extracted = match state
+    let extracted_list = match state
         .ai
-        .extract_restaurant_info(&metadata.title, &metadata.content, url.as_str())
+        .extract_restaurants(&metadata.title, &metadata.content, url.as_str())
         .await
     {
-        Ok(info) => info,
+        Ok(list) => list,
         Err(e) => {
             bot.edit_message_text(
                 msg.chat.id,
@@ -249,92 +250,167 @@ async fn handle_shared_link(
         }
     };
 
-    let restaurant_name = extracted
-        .restaurant_name
-        .clone()
-        .unwrap_or_else(|| metadata.title.clone());
+    if extracted_list.is_empty() {
+        bot.edit_message_text(
+            msg.chat.id,
+            processing.id,
+            "🤷 Couldn't find any restaurants in that content.",
+        )
+        .await?;
+        return Ok(());
+    }
 
-    let google_maps_url = if let Some(ref query) = extracted.google_maps_query {
-        let encoded: String =
-            url::form_urlencoded::Serializer::new(String::new())
-                .append_key_only(query)
-                .finish();
-        Some(format!("https://www.google.com/maps/search/{encoded}"))
-    } else {
-        None
-    };
+    // Save all extracted restaurants
+    let mut saved_restaurants: Vec<db::models::Restaurant> = Vec::new();
+    let mut save_errors: Vec<String> = Vec::new();
 
-    let new_restaurant = db::models::NewRestaurant {
-        user_id,
-        name: restaurant_name,
-        source_url: Some(url.to_string()),
-        google_maps_url,
-        description: extracted.description,
-        cuisine_tags: extracted.tags,
-    };
+    for (i, extracted) in extracted_list.iter().enumerate() {
+        // Better fallback: if AI couldn't extract a name, use a numbered placeholder
+        let restaurant_name = extracted
+            .restaurant_name
+            .clone()
+            .unwrap_or_else(|| {
+                if extracted_list.len() > 1 {
+                    format!("🍽️ #{} from {}", i + 1, metadata.title)
+                } else {
+                    metadata.title.clone()
+                }
+            });
 
-    match db::save_restaurant(&state.db, &new_restaurant).await {
-        Ok(saved) => {
-            let tags = if saved.cuisine_tags.is_empty() {
-                "No tags".to_string()
-            } else {
-                saved
-                    .cuisine_tags
-                    .iter()
-                    .map(|t| format!("#{}", html::escape(t)))
-                    .collect::<Vec<_>>()
-                    .join("  ")
-            };
+        let google_maps_url = if let Some(ref query) = extracted.google_maps_query {
+            let encoded: String =
+                url::form_urlencoded::Serializer::new(String::new())
+                    .append_key_only(query)
+                    .finish();
+            Some(format!("https://www.google.com/maps/search/{encoded}"))
+        } else {
+            None
+        };
 
-            let maps_link = saved
-                .google_maps_url
-                .as_deref()
-                .map(|u| format!("\n📍 {}", html::link(u, "Open in Google Maps")))
-                .unwrap_or_default();
+        let new_restaurant = db::models::NewRestaurant {
+            owner_id: db::derive_owner_id(user_id),
+            user_id,
+            name: restaurant_name,
+            source_url: Some(url.to_string()),
+            google_maps_url,
+            description: extracted.description.clone(),
+            cuisine_tags: extracted.tags.clone(),
+        };
 
-            let desc = saved
-                .description
-                .as_deref()
-                .map(|d| format!("\n📝 {}", html::escape(d)))
-                .unwrap_or_default();
-
-            let name = html::escape(&saved.name);
-            let src = saved
-                .source_url
-                .as_deref()
-                .map(|u| html::link(u, "Original Post"))
-                .unwrap_or_else(|| "Original Post".to_string());
-            let card = format!(
-                "✅ <b>Saved!</b>\n\n🍽️ <b>{name}</b>{desc}\n\n🏷️ {tags}{maps}\n\n🔗 {src}",
-                name = name,
-                desc = desc,
-                tags = tags,
-                maps = maps_link,
-                src = src
-            );
-
-            let keyboard = InlineKeyboardMarkup::new(vec![vec![
-                InlineKeyboardButton::callback(
-                    "✅ Visited", format!("visited:{}", saved.id),
-                ),
-                InlineKeyboardButton::callback(
-                    "🗑️ Delete", format!("delete:{}", saved.id),
-                ),
-            ]]);
-
-            bot.edit_message_text(msg.chat.id, processing.id, card)
-                .parse_mode(ParseMode::Html)
-                .reply_markup(keyboard)
-                .await?;
+        match db::save_restaurant(&state.db, &new_restaurant).await {
+            Ok(saved) => saved_restaurants.push(saved),
+            Err(e) => save_errors.push(format!(
+                "{}: {e}",
+                extracted.restaurant_name.as_deref().unwrap_or("Unknown")
+            )),
         }
-        Err(e) => {
-            bot.edit_message_text(
-                msg.chat.id,
-                processing.id,
-                format!("❌ Couldn't save: {e}"),
-            )
+    }
+
+    let count = saved_restaurants.len();
+
+    // If nothing saved, show error
+    if count == 0 {
+        let error_detail = if save_errors.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nErrors:\n{}", save_errors.join("\n"))
+        };
+        bot.edit_message_text(
+            msg.chat.id,
+            processing.id,
+            format!("❌ Couldn't save any restaurants.{}", error_detail),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Helper: build a restaurant card + inline keyboard
+    let build_card = |saved: &db::models::Restaurant| -> (String, InlineKeyboardMarkup) {
+        let tags_display = if saved.cuisine_tags.is_empty() {
+            "No tags".to_string()
+        } else {
+            saved
+                .cuisine_tags
+                .iter()
+                .map(|t| format!("#{}", html::escape(t)))
+                .collect::<Vec<_>>()
+                .join("  ")
+        };
+
+        let maps_link = saved
+            .google_maps_url
+            .as_deref()
+            .map(|u| format!("\n📍 {}", html::link(u, "Open in Google Maps")))
+            .unwrap_or_default();
+
+        let desc = saved
+            .description
+            .as_deref()
+            .map(|d| format!("\n📝 {}", html::escape(d)))
+            .unwrap_or_default();
+
+        let src = saved
+            .source_url
+            .as_deref()
+            .map(|u| html::link(u, "Original Post"))
+            .unwrap_or_else(|| "Original Post".to_string());
+
+        let name = html::escape(&saved.name);
+        let card = format!(
+            "🍽️ <b>{name}</b>{desc}\n\n🏷️ {tags_display}{maps_link}\n\n🔗 {src}",
+        );
+
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![
+            InlineKeyboardButton::callback(
+                "✅ Visited",
+                format!("visited:{}", saved.id),
+            ),
+            InlineKeyboardButton::callback(
+                "🗑️ Delete",
+                format!("delete:{}", saved.id),
+            ),
+        ]]);
+
+        (card, keyboard)
+    };
+
+    // ── Single restaurant ──────────────────────────────────────────
+    if count == 1 {
+        let saved = &saved_restaurants[0];
+        let (card, kb) = build_card(saved);
+        let full = format!("✅ <b>Saved!</b>\n\n{card}");
+
+        bot.edit_message_text(msg.chat.id, processing.id, full)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(kb)
             .await?;
-        }
+        return Ok(());
+    }
+
+    // ── Multiple restaurants ───────────────────────────────────────
+    // Turn the processing message into a header
+    let header = format!("✅ <b>Saved {count} restaurants!</b>\n\nFrom: {}", html::link(url.as_str(), &metadata.title));
+    bot.edit_message_text(msg.chat.id, processing.id, header)
+        .parse_mode(ParseMode::Html)
+        .await?;
+
+    // Send each restaurant as its own reply with full buttons
+    for saved in &saved_restaurants {
+        let (card, kb) = build_card(saved);
+        bot.send_message(msg.chat.id, &card)
+            .parse_mode(ParseMode::Html)
+            .reply_markup(kb)
+            .reply_to_message_id(msg.id)
+            .await?;
+    }
+
+    // Report any save failures
+    if !save_errors.is_empty() {
+        bot.send_message(
+            msg.chat.id,
+            format!("⚠️ Some saves failed:\n{}", save_errors.join("\n")),
+        )
+        .await?;
     }
 
     Ok(())

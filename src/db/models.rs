@@ -6,6 +6,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Restaurant {
     pub id: Uuid,
+    pub owner_id: Uuid,
     pub user_id: i64,
     pub name: String,
     pub source_url: Option<String>,
@@ -19,6 +20,7 @@ pub struct Restaurant {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewRestaurant {
+    pub owner_id: Uuid,
     pub user_id: i64,
     pub name: String,
     pub source_url: Option<String>,
