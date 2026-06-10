@@ -28,6 +28,8 @@ pub enum Command {
     Undo,
     #[command(description = "Add a restaurant manually: /add Restaurant Name")]
     Add(String),
+    #[command(description = "Add a tag to the last restaurant: /addtag ramen")]
+    Addtag(String),
 }
 
 /// /start command
@@ -439,6 +441,98 @@ pub async fn cmd_add(
                 msg.chat.id,
                 processing.id,
                 format!("❌ Couldn't rename: {e}"),
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// /addtag command — add a tag to the last restaurant
+pub async fn cmd_addtag(
+    bot: Bot,
+    msg: Message,
+    state: Arc<AppState>,
+) -> Result<(), teloxide::RequestError> {
+    let user_id = match msg.from().map(|u| u.id.0 as i64) {
+        Some(id) => id,
+        None => return Ok(()),
+    };
+
+    let text = msg.text().unwrap_or("");
+    let tag_text = text
+        .strip_prefix("/addtag")
+        .or_else(|| text.strip_prefix("/addtag@"))
+        .unwrap_or("")
+        .trim();
+
+    if tag_text.is_empty() {
+        bot.send_message(
+            msg.chat.id,
+            "Usage: <code>/addtag ramen</code>\n\nAdds a tag to the last restaurant you added.\nYou can add multiple tags: <code>/addtag ramen, spicy, japanese</code>",
+        )
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .await?;
+        return Ok(());
+    }
+
+    // Parse tags: split by comma or whitespace
+    let tags: Vec<String> = if tag_text.contains(',') {
+        tag_text.split(',').map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).collect()
+    } else {
+        tag_text.split_whitespace().map(|t| t.to_lowercase()).collect()
+    };
+
+    if tags.is_empty() {
+        bot.send_message(msg.chat.id, "Please provide at least one tag.").await?;
+        return Ok(());
+    }
+
+    let processing = bot
+        .send_message(msg.chat.id, "🏷️ Adding tag(s)...")
+        .reply_to_message_id(msg.id)
+        .await?;
+
+    match db::add_tags_to_last_restaurant(&state.db, user_id, &tags).await {
+        Ok(Some(updated)) => {
+            let tags_display = if updated.cuisine_tags.is_empty() {
+                "No tags".to_string()
+            } else {
+                updated.cuisine_tags.iter()
+                    .map(|t| format!("#{}", teloxide::utils::html::escape(t)))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            };
+            let name = teloxide::utils::html::escape(&updated.name);
+
+            let card = format!(
+                "✅ <b>Tag(s) added!</b>\n\n🍽️ <b>{name}</b>\n\n🏷️ {tags_display}",
+            );
+
+            let keyboard = teloxide::types::InlineKeyboardMarkup::new(vec![vec![
+                teloxide::types::InlineKeyboardButton::callback("✅ Visited", format!("visited:{}", updated.id)),
+                teloxide::types::InlineKeyboardButton::callback("🗑️ Delete", format!("delete:{}", updated.id)),
+            ]]);
+
+            bot.edit_message_text(msg.chat.id, processing.id, card)
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .reply_markup(keyboard)
+                .await?;
+        }
+        Ok(None) => {
+            bot.edit_message_text(
+                msg.chat.id,
+                processing.id,
+                "📭 Your backlog is empty. Add a restaurant first!",
+            )
+            .await?;
+        }
+        Err(e) => {
+            bot.edit_message_text(
+                msg.chat.id,
+                processing.id,
+                format!("❌ Couldn't add tag: {e}"),
             )
             .await?;
         }

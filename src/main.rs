@@ -172,6 +172,7 @@ async fn handle_command(
         Command::Visited => bot::handlers::cmd_visited(bot, msg, state).await,
         Command::Undo => bot::handlers::cmd_undo(bot, msg, state).await,
         Command::Add(_) => bot::handlers::cmd_add(bot, msg, state).await,
+        Command::Addtag(_) => bot::handlers::cmd_addtag(bot, msg, state).await,
     }
 }
 

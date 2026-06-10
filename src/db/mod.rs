@@ -240,6 +240,43 @@ pub async fn delete_last_restaurants(pool: &DbPool, user_id: i64, n: i64) -> Res
     Ok(result.rows_affected())
 }
 
+/// Add one or more tags to the most recently added restaurant for a user
+pub async fn add_tags_to_last_restaurant(
+    pool: &DbPool,
+    user_id: i64,
+    new_tags: &[String],
+) -> Result<Option<Restaurant>, sqlx::Error> {
+    // We can't easily append to a PostgreSQL array in one query with sqlx
+    // because of the way bindings work. Use a two-step: fetch last, then update.
+    let last = get_last_restaurant(pool, user_id).await?;
+    let Some(last) = last else {
+        return Ok(None);
+    };
+
+    // Merge existing tags with new ones (deduplicate, case-insensitive)
+    let mut all_tags: Vec<String> = last.cuisine_tags.clone();
+    for tag in new_tags {
+        let tag_lower = tag.to_lowercase();
+        if !all_tags.iter().any(|t| t.to_lowercase() == tag_lower) {
+            all_tags.push(tag_lower);
+        }
+    }
+
+    let tags_slice: &[String] = &all_tags;
+    sqlx::query_as::<_, Restaurant>(
+        r#"
+        UPDATE restaurants
+        SET cuisine_tags = $1
+        WHERE id = $2
+        RETURNING *
+        "#,
+    )
+    .bind(tags_slice)
+    .bind(last.id)
+    .fetch_optional(pool)
+    .await
+}
+
 /// Get the most recently added restaurant for a user
 pub async fn get_last_restaurant(pool: &DbPool, user_id: i64) -> Result<Option<Restaurant>, sqlx::Error> {
     sqlx::query_as::<_, Restaurant>(
