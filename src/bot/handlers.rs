@@ -26,6 +26,8 @@ pub enum Command {
     Visited,
     #[command(description = "Undo: remove the most recent saved restaurant")]
     Undo,
+    #[command(description = "Add a restaurant manually: /add Restaurant Name")]
+    Add(String),
 }
 
 /// /start command
@@ -299,6 +301,113 @@ pub async fn cmd_undo(
         }
         Err(e) => {
             bot.send_message(msg.chat.id, format!("❌ Couldn't undo: {e}")).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// /add command — manually add a restaurant by name
+pub async fn cmd_add(
+    bot: Bot,
+    msg: Message,
+    state: Arc<AppState>,
+) -> Result<(), teloxide::RequestError> {
+    let user_id = match msg.from().map(|u| u.id.0 as i64) {
+        Some(id) => id,
+        None => return Ok(()),
+    };
+
+    let text = msg.text().unwrap_or("");
+    let name = text
+        .strip_prefix("/add")
+        .or_else(|| text.strip_prefix("/add@"))
+        .unwrap_or("")
+        .trim();
+
+    if name.is_empty() {
+        bot.send_message(
+            msg.chat.id,
+            "Usage: <code>/add Restaurant Name</code>\n\nExample: <code>/add Sushi Tanaka Tokyo</code>",
+        )
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .await?;
+        return Ok(());
+    }
+
+    let processing = bot
+        .send_message(msg.chat.id, "🧠 Looking up info on that restaurant...")
+        .reply_to_message_id(msg.id)
+        .await?;
+
+    // Try to enrich with AI
+    let extracted = match state.ai.enrich_restaurant_name(name, "Manually added by user. No source link.").await {
+        Ok(info) => info,
+        Err(_) => {
+            // AI failed, save with just the name
+            db::models::ExtractedInfo {
+                restaurant_name: Some(name.to_string()),
+                cuisine_type: None,
+                tags: vec![],
+                google_maps_query: Some(name.to_string()),
+                description: None,
+            }
+        }
+    };
+
+    let restaurant_name = extracted.restaurant_name.clone().unwrap_or_else(|| name.to_string());
+    let google_maps_url = extracted.google_maps_query.as_ref().map(|q| {
+        let encoded: String = url::form_urlencoded::Serializer::new(String::new())
+            .append_key_only(q)
+            .finish();
+        format!("https://www.google.com/maps/search/{encoded}")
+    });
+
+    let new_restaurant = db::models::NewRestaurant {
+        owner_id: crate::db::derive_owner_id(user_id),
+        user_id,
+        name: restaurant_name,
+        source_url: None,
+        google_maps_url,
+        description: extracted.description,
+        cuisine_tags: extracted.tags,
+    };
+
+    match db::save_restaurant(&state.db, &new_restaurant).await {
+        Ok(saved) => {
+            let tags_display = if saved.cuisine_tags.is_empty() {
+                "No tags".to_string()
+            } else {
+                saved.cuisine_tags.iter()
+                    .map(|t| format!("#{}", teloxide::utils::html::escape(t)))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            };
+            let maps_link = saved.google_maps_url.as_deref()
+                .map(|u| format!("\n📍 {}", teloxide::utils::html::link(u, "Open in Google Maps")))
+                .unwrap_or_default();
+            let desc = saved.description.as_deref()
+                .map(|d| format!("\n📝 {}", teloxide::utils::html::escape(d)))
+                .unwrap_or_default();
+            let name_escaped = teloxide::utils::html::escape(&saved.name);
+
+            let card = format!(
+                "✅ <b>Saved!</b>\n\n🍽️ <b>{name_escaped}</b>{desc}\n\n🏷️ {tags_display}{maps_link}",
+            );
+
+            let keyboard = teloxide::types::InlineKeyboardMarkup::new(vec![vec![
+                teloxide::types::InlineKeyboardButton::callback("✅ Visited", format!("visited:{}", saved.id)),
+                teloxide::types::InlineKeyboardButton::callback("🗑️ Delete", format!("delete:{}", saved.id)),
+            ]]);
+
+            bot.edit_message_text(msg.chat.id, processing.id, card)
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .reply_markup(keyboard)
+                .await?;
+        }
+        Err(e) => {
+            bot.edit_message_text(msg.chat.id, processing.id, format!("❌ Couldn't save: {e}"))
+                .await?;
         }
     }
 

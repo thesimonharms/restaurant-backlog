@@ -134,6 +134,36 @@ impl DeepSeekClient {
         })
     }
 
+    /// Given just a restaurant name, use AI to enrich it with cuisine, tags, maps query, and description.
+    /// Returns a single ExtractedInfo with best-guess details.
+    pub async fn enrich_restaurant_name(
+        &self,
+        name: &str,
+        context: &str,
+    ) -> Result<ExtractedInfo, AppError> {
+        let system = "You are a restaurant information assistant. Given a restaurant name, provide your best \
+            guess for its details. Return ONLY valid JSON with no markdown formatting or code blocks.\n\n\
+            Fields:\n\
+            - restaurant_name: The name of the restaurant (use the given name)\n\
+            - cuisine_type: Best guess at cuisine e.g. \"Korean BBQ\", \"Italian\" (null if unknown)\n\
+            - tags: Array of relevant tags e.g. [\"korean\", \"bbq\"] (empty if unknown)\n\
+            - google_maps_query: A Google Maps search query to find this restaurant (use the name + location hints if any)\n\
+            - description: Brief 1-2 sentence description";
+
+        let user = format!(
+            "Restaurant name: {name}\nContext: {context}"
+        );
+
+        let raw = self.chat(system, &user).await?;
+        let cleaned = Self::clean_json(&raw);
+
+        serde_json::from_str::<ExtractedInfo>(&cleaned).map_err(|e| {
+            AppError::Ai(format!(
+                "Failed to parse AI response as JSON. Raw: {raw}. Error: {e}"
+            ))
+        })
+    }
+
     /// Recommend restaurants based on a user query
     pub async fn recommend(
         &self,
